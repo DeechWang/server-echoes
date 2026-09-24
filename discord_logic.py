@@ -1,9 +1,9 @@
 import discord
 import json
+import asyncio
 from discord.ext import commands
-from typing import Callable
-from asyncio import get_running_loop
-from datetime import datetime
+
+
 class DiscordSelfBot:
     def __init__(self):
         """
@@ -15,8 +15,6 @@ class DiscordSelfBot:
         self.config = self._load_config()
         self.token = self.config.get('credentials', {}).get('Token', '')
         self.prefix = '!'
-
-        # Store the callback
 
         # Setup bot
         intents = discord.Intents.all()
@@ -45,6 +43,22 @@ class DiscordSelfBot:
         except json.JSONDecodeError:
             raise ValueError("Invalid JSON in config.json")
 
+    async def _fetch_message_selfbot(self, channel, message_id):
+        """Self-bot compliant replacement for fetch_message()"""
+        # 1. Check local cache first
+        for msg in self.client.cached_messages:
+            if msg.id == message_id:
+                return msg
+
+        # 2. Fall back to channel.history (allowed for user tokens)
+        try:
+            async for msg in channel.history(limit=10, around=discord.Object(id=message_id)):
+                if msg.id == message_id:
+                    return msg
+        except Exception as e:
+            print(f"Error reading history for target message: {e}")
+        return None
+
     def _setup_events(self):
         """
         Setup event handlers for the bot.
@@ -57,95 +71,76 @@ class DiscordSelfBot:
 
         @self.client.event
         async def on_ready():
-            """Called when the bot is ready and connected to Discord"""
-            ready_message = f"Logged in as {self.client.user.name}"
-            print(ready_message)  # Keep console logging
+            print(f"Logged in as {self.client.user.name}")
 
         @self.client.event
         async def on_message(message):
             await self.client.process_commands(message)
 
-            source_channel_id = [1259607738040979489]
-            destination_channel_id = 1338207422694559747
-            if message.channel.id in source_channel_id:
+            # source_channel_ids = [1104477384838758633]
+            source_channel_ids = [1259607738040979489]  # test general
+            # destination_channel_id = 1331274153638232231
+            destination_channel_id = 1338207422694559747  # test output
+
+            if message.channel.id in source_channel_ids:
                 try:
-                    async for latest_message in message.channel.history(limit=1):
-                        content_description = []
-                        message_to_process = None
+                    message_to_process = message
 
-                        if hasattr(latest_message, 'reference') and latest_message.reference:
-                            original_channel = self.client.get_channel(latest_message.reference.channel_id)
-                            if original_channel:
-                                async for hist_message in original_channel.history(limit=100):
-                                    if hist_message.id == latest_message.reference.message_id:
-                                        #print("Found original message!")
-                                        message_to_process = hist_message
-                                        break
-                        else:
-                            print("Processing direct message!")
-                            message_to_process = latest_message
+                    # Handle referenced/replied messages using self-bot history search
+                    if hasattr(message, 'reference') and message.reference and message.reference.message_id:
+                        ref_channel = self.client.get_channel(message.reference.channel_id)
+                        if ref_channel:
+                            fetched_msg = await self._fetch_message_selfbot(ref_channel, message.reference.message_id)
+                            if fetched_msg:
+                                message_to_process = fetched_msg
 
-                        if message_to_process:
-                            # Process the content and handle role mentions
-                            if message_to_process.content:
-                                content = message_to_process.content
+                    # Wait if message has links but embeds haven't populated yet
+                    if not message_to_process.embeds and (
+                            "http://" in message_to_process.content or "https://" in message_to_process.content):
+                        print("URL detected without embed. Waiting 2 seconds for Discord to parse link...")
+                        await asyncio.sleep(2.0)
 
-                                content_description.append(f"{content}")
-                            print("content description: ",content_description)
-                            # Forward the message
-                            destination_channel = self.client.get_channel(destination_channel_id)
-                            if destination_channel:
-                                channel_message = (
-                                    f"{'\n'.join(content_description)}\n"
-                                )
-                                await destination_channel.send(channel_message)
+                        # Re-fetch fresh message using history instead of fetch_message
+                        updated_msg = await self._fetch_message_selfbot(message.channel, message_to_process.id)
+                        if updated_msg:
+                            message_to_process = updated_msg
 
-                                # Handle attachments and embeds
-                                if message_to_process.attachments:
-                                    for attachment in message_to_process.attachments:
-                                        await destination_channel.send(attachment.url)
+                    destination_channel = self.client.get_channel(destination_channel_id)
+                    if not destination_channel:
+                        print(f"Could not find destination channel ID: {destination_channel_id}")
+                        return
 
-                                if message_to_process.embeds:
-                                    for embed in message_to_process.embeds:
-                                        if embed.image and embed.image.url:  # Check if image exists and has URL
-                                            #if embed.image.url.startswith('https://dubclub.win/iv/'):
-                                            print(f"Embed image URL: {embed.image.url}")
-                                            await destination_channel.send(embed.image.url)
+                    # Forward text content
+                    if message_to_process.content:
+                        await destination_channel.send(message_to_process.content)
 
-                                #print(f"Message forwarded to channel: {destination_channel.name}")
-                            else:
-                                print(f"Could not find destination channel with ID: {destination_channel_id}")
+                    # Forward direct attachments
+                    if message_to_process.attachments:
+                        for attachment in message_to_process.attachments:
+                            await destination_channel.send(attachment.url)
+
+                    # Forward embed images & thumbnails
+                    if message_to_process.embeds:
+                        for embed in message_to_process.embeds:
+                            image_url = None
+                            if embed.image:
+                                image_url = embed.image.url or embed.image.proxy_url
+                            elif embed.thumbnail:
+                                image_url = embed.thumbnail.url or embed.thumbnail.proxy_url
+
+                            if image_url:
+                                print(f"Forwarding image URL: {image_url}")
+                                await destination_channel.send(image_url)
 
                 except Exception as e:
-                    print(f"Error in message processing: {str(e)}")
                     import traceback
-                    print(f"Full error: {traceback.format_exc()}")
-        @self.client.event
-        async def on_command(ctx):
-            """Called whenever a command is executed"""
-            print(f"Command used - {ctx.command.name}")
+                    print(f"Error processing message: {str(e)}")
+                    print(traceback.format_exc())
 
     def _setup_commands(self):
         @self.client.command()
         async def test(ctx):
-            """Test command to verify bot functionality"""
-            try:
-                print(f"Starting test command execution in channel: {ctx.channel.name}")
-
-                try:
-                    await ctx.message.delete()
-                    print("Successfully deleted command message")
-                except Exception as e:
-                    print(f"Error deleting message: {str(e)}")
-
-                try:
-                    await ctx.send("Hello World!")
-                    print("Successfully sent response message")
-                except Exception as e:
-                    print(f"Error sending response: {str(e)}")
-
-            except Exception as e:
-                print(f"Overall command error: {str(e)}")
+            await ctx.send("Hello World!")
 
     def run(self):
         """
@@ -154,9 +149,6 @@ class DiscordSelfBot:
         """
         try:
             self.client.run(self.token, bot=False)
-            #self.client.run(self.token)
-        except discord.LoginFailure:
-            raise ValueError("Invalid token in config.json")
         except Exception as e:
             raise Exception(f"Failed to start bot: {str(e)}")
         finally:
